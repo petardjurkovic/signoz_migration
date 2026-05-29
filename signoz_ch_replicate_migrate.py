@@ -155,6 +155,20 @@ def get_tables(ch: "CH", db_pattern: str) -> list[TableInfo]:
     return [TableInfo(database=r[0], name=r[1], engine=r[2], engine_full=r[3]) for r in rows]
 
 
+def get_materialized_views(ch: "CH", db_pattern: str) -> list[tuple[str, str]]:
+    rows = ch.query_rows(
+        """
+        SELECT database, name
+        FROM system.tables
+        WHERE database LIKE {db_pattern:String}
+          AND engine = 'MaterializedView'
+        ORDER BY database, name
+        """,
+        {"db_pattern": db_pattern},
+    )
+    return [(r[0], r[1]) for r in rows]
+
+
 def get_databases(ch: "CH", db_pattern: str) -> list[str]:
     rows = ch.query_rows(
         """
@@ -320,14 +334,15 @@ def to_replicated_create_ddl(
     return ddl[:engine_start] + new_engine_expr + ddl[engine_end:]
 
 
-def make_chs2_ddl(ddl: str) -> str:
+def make_recreatable_ddl(ddl: str) -> str:
     """
-    Make SHOW CREATE output safe to replay on chs2 for any object type
-    (table, view, materialized view, dictionary, distributed):
-      - strip the table-level UUID clause so chs2 assigns its own,
+    Make SHOW CREATE output safe to replay on another node (or to recreate on
+    the same node after a drop) for any object type -- table, view, materialized
+    view, dictionary, distributed:
+      - strip the object-level UUID clause so a fresh UUID is assigned,
       - add IF NOT EXISTS,
       - otherwise preserve the statement verbatim (do NOT touch the column
-        list or a view's SELECT body).
+        list or a view's SELECT body, and never inject POPULATE).
     """
     ddl = re.sub(r"(?is)\s+UUID\s+'[^']*'", " ", ddl, count=1)
 
@@ -579,15 +594,104 @@ def phase_5_create_databases(ch1: "CH", ch2: "CH", args):
     print(f"[OK] databases processed on chs2: {len(dbs)}")
 
 
-def should_process_table(args, t: TableInfo) -> bool:
-    if args.database and t.database != args.database:
+def should_process(args, database: str, name: str) -> bool:
+    if args.database and database != args.database:
         return False
-    if args.table and t.name != args.table:
+    if args.table and name != args.table:
         return False
     return True
 
 
+def should_process_table(args, t: TableInfo) -> bool:
+    return should_process(args, t.database, t.name)
+
+
+def mv_manifest_path(args) -> Path:
+    return args.out_dir / "mv_manifest.json"
+
+
+def mv_ddl_path(args, database: str, name: str) -> Path:
+    return args.out_dir / "mv" / f"{database}.{name}.sql"
+
+
+def load_captured_mv_ddl(args, database: str, name: str) -> Optional[str]:
+    p = mv_ddl_path(args, database, name)
+    if p.exists():
+        return p.read_text(encoding="utf-8").strip().rstrip(";").strip()
+    return None
+
+
+def load_mv_worklist(ch1: "CH", args) -> list[tuple[str, str]]:
+    # Prefer the manifest captured by phase 5.5 -- after DETACH the MVs no longer
+    # show up in system.tables, so the manifest is the only record of them.
+    mp = mv_manifest_path(args)
+    if mp.exists():
+        data = load_json(mp)
+        return [(m["database"], m["name"]) for m in data.get("materialized_views", [])]
+    return get_materialized_views(ch1, args.db_pattern)
+
+
+def phase_5_5_capture_and_detach_mvs(ch1: "CH", args):
+    """
+    Snapshot every MaterializedView DDL to a file, then DETACH the MVs on chs1.
+    Detaching removes them from the dependency graph so phase 6 can rename their
+    source/target tables (otherwise check_table_dependencies blocks the RENAME),
+    and re-attaching later (phase 9) re-resolves the source/target by NAME so the
+    MV binds to the new replicated tables. DETACH (not DROP) keeps metadata on
+    disk and is reversible. No data is lost: these are TO-target MVs whose data
+    lives in their target tables, which phase 6 converts.
+    """
+    mvs = [m for m in get_materialized_views(ch1, args.db_pattern) if should_process(args, *m)]
+    if not mvs:
+        print("[INFO] no materialized views found to detach")
+        return
+
+    mv_dir = args.out_dir / "mv"
+    mv_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "db_pattern": args.db_pattern,
+        "materialized_views": [],
+    }
+    for db, name in mvs:
+        ddl = show_create(ch1, db, name)
+        f = mv_ddl_path(args, db, name)
+        f.write_text(ddl + ";\n", encoding="utf-8")
+        manifest["materialized_views"].append(
+            {"database": db, "name": name, "ddl_file": str(f)}
+        )
+        print(f"[DDL] captured {f}")
+
+    save_json(mv_manifest_path(args), manifest)
+    print(f"[OK] captured {len(mvs)} MV DDLs; manifest: {mv_manifest_path(args)}")
+
+    for db, name in mvs:
+        ch1.command(f"DETACH TABLE {qtable(db, name)}")
+
+    if args.dry_run or not args.execute:
+        print(
+            f"[DRY-RUN] captured {len(mvs)} MV DDLs but did NOT detach. "
+            f"Re-run with --execute to detach them on chs1."
+        )
+    else:
+        print(f"[OK] detached {len(mvs)} MVs on chs1 (metadata kept on disk)")
+
+
 def phase_6_migrate_local_tables_on_chs1(ch1: "CH", args):
+    attached_mvs = [m for m in get_materialized_views(ch1, args.db_pattern) if should_process(args, *m)]
+    if attached_mvs:
+        print(
+            f"[WARN] {len(attached_mvs)} materialized view(s) are still attached and depend on "
+            f"these tables. RENAME will be blocked by check_table_dependencies and re-binding "
+            f"would break. Run phase 5.5 (--phase 5.5 ... --execute) to detach them first."
+        )
+        if args.execute and not args.table:
+            raise RuntimeError(
+                "Refusing bulk phase 6 while materialized views are attached. "
+                "Run --phase 5.5 --execute first."
+            )
+
     tables = get_tables(ch1, args.db_pattern)
     candidates = [
         t
@@ -710,7 +814,7 @@ def phase_7_create_replicated_tables_on_chs2(ch1: "CH", ch2: "CH", args):
             print(f"[SKIP] exists on chs2: {db}.{table}")
             continue
 
-        ddl = make_chs2_ddl(show_create(ch1, db, table))
+        ddl = make_recreatable_ddl(show_create(ch1, db, table))
 
         ddl_file = args.out_dir / "ddl" / f"{db}.{table}.phase7.create_chs2.sql"
         ddl_file.parent.mkdir(parents=True, exist_ok=True)
@@ -737,7 +841,7 @@ def phase_8_recreate_distributed_tables(ch1: "CH", ch2: "CH", args):
             print(f"[SKIP] exists on chs2: {db}.{table}")
             continue
 
-        ddl = make_chs2_ddl(show_create(ch1, db, table))
+        ddl = make_recreatable_ddl(show_create(ch1, db, table))
 
         ddl_file = args.out_dir / "ddl" / f"{db}.{table}.phase8.create_distributed_chs2.sql"
         ddl_file.parent.mkdir(parents=True, exist_ok=True)
@@ -749,24 +853,49 @@ def phase_8_recreate_distributed_tables(ch1: "CH", ch2: "CH", args):
     print("[OK] phase 8 done")
 
 
-def phase_9_recreate_views(ch1: "CH", ch2: "CH", args):
-    tables = get_tables(ch1, args.db_pattern)
-    candidates = [
-        t for t in tables
-        if t.engine in ("View", "MaterializedView") and should_process_table(args, t)
-    ]
+def phase_9_recreate_mvs(ch1: "CH", ch2: "CH", args):
+    """
+    chs1: re-ATTACH the MVs detached in phase 5.5 so they re-bind (by name) to
+          the new replicated source/target tables. Fall back to a CREATE from the
+          captured DDL only if ATTACH cannot recover.
+    chs2: CREATE each MV from the captured DDL (UUID stripped, no POPULATE).
+    Run after phase 7 so the MVs' source and target tables already exist on chs2.
+    """
+    worklist = [m for m in load_mv_worklist(ch1, args) if should_process(args, *m)]
+    if not worklist:
+        print("[INFO] no materialized views to recreate")
+        return
 
-    for t in candidates:
-        db, table = t.database, t.name
-        print(f"\n[phase 9] create view on chs2: {db}.{table}")
+    for db, name in worklist:
+        print(f"\n[phase 9] materialized view {db}.{name}")
 
-        if table_exists(ch2, db, table):
-            print(f"[SKIP] exists on chs2: {db}.{table}")
+        # --- chs1: re-attach the detached MV ---
+        if table_exists(ch1, db, name):
+            print(f"[SKIP chs1] already attached: {db}.{name}")
+        else:
+            try:
+                ch1.command(f"ATTACH TABLE {qtable(db, name)}")
+                print(f"[OK chs1] re-attached {db}.{name}")
+            except Exception as exc:
+                captured = load_captured_mv_ddl(args, db, name)
+                hint = (
+                    f"recreate manually from {mv_ddl_path(args, db, name)}"
+                    if captured else "no captured DDL found"
+                )
+                print(f"[ERROR chs1] ATTACH failed for {db}.{name}: {exc} -- {hint}")
+
+        # --- chs2: create from captured DDL ---
+        if table_exists(ch2, db, name):
+            print(f"[SKIP chs2] exists: {db}.{name}")
             continue
 
-        ddl = make_chs2_ddl(show_create(ch1, db, table))
+        captured = load_captured_mv_ddl(args, db, name)
+        if captured is None:
+            # No manifest (MV was never detached) -- read it live from chs1.
+            captured = show_create(ch1, db, name)
 
-        ddl_file = args.out_dir / "ddl" / f"{db}.{table}.phase9.create_view_chs2.sql"
+        ddl = make_recreatable_ddl(captured)
+        ddl_file = args.out_dir / "ddl" / f"{db}.{name}.phase9.create_mv_chs2.sql"
         ddl_file.parent.mkdir(parents=True, exist_ok=True)
         ddl_file.write_text(ddl + ";\n", encoding="utf-8")
         print(f"[DDL] wrote {ddl_file}")
@@ -781,7 +910,12 @@ def parse_args():
         description="Manual SigNoz ClickHouse MergeTree -> ReplicatedMergeTree migration helper"
     )
 
-    p.add_argument("--phase", type=int, required=True, choices=range(1, 10))
+    p.add_argument(
+        "--phase",
+        required=True,
+        choices=["1", "2", "3", "4", "5", "5.5", "6", "7", "8", "9"],
+        help="5.5 = capture + DETACH materialized views on chs1 (run before phase 6).",
+    )
 
     p.add_argument("--ch1-host", default="chs1")
     p.add_argument("--ch2-host", default="chs2")
@@ -837,15 +971,15 @@ def parse_args():
 def main():
     args = parse_args()
 
-    if args.phase == 1:
+    if args.phase == "1":
         phase_1_stop_collectors(args)
         return
 
     ch1, ch2 = connect(args)
 
-    if args.phase == 2:
+    if args.phase == "2":
         phase_2_verify_keeper(ch1, ch2)
-    elif args.phase == 3:
+    elif args.phase == "3":
         phase_3_verify_macros(
             ch1=ch1,
             ch2=ch2,
@@ -853,18 +987,20 @@ def main():
             ch1_replica=args.ch1_replica,
             ch2_replica=args.ch2_replica,
         )
-    elif args.phase == 4:
+    elif args.phase == "4":
         phase_4_inventory(ch1, args)
-    elif args.phase == 5:
+    elif args.phase == "5":
         phase_5_create_databases(ch1, ch2, args)
-    elif args.phase == 6:
+    elif args.phase == "5.5":
+        phase_5_5_capture_and_detach_mvs(ch1, args)
+    elif args.phase == "6":
         phase_6_migrate_local_tables_on_chs1(ch1, args)
-    elif args.phase == 7:
+    elif args.phase == "7":
         phase_7_create_replicated_tables_on_chs2(ch1, ch2, args)
-    elif args.phase == 8:
+    elif args.phase == "8":
         phase_8_recreate_distributed_tables(ch1, ch2, args)
-    elif args.phase == 9:
-        phase_9_recreate_views(ch1, ch2, args)
+    elif args.phase == "9":
+        phase_9_recreate_mvs(ch1, ch2, args)
     else:
         raise SystemExit(f"Unsupported phase: {args.phase}")
 

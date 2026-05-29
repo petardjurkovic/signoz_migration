@@ -116,9 +116,17 @@ ClickHouse server logs (when a command errors with no detail):
 ### Recommended order
 
 ```
-1 → 2 → 3 → 4 → 5 → 6 (test one table first) → 7 → 8 → 9
+1 → 2 → 3 → 4 → 5 → 5.5 → 6 (test one table first) → 7 → 8 → 9
 ```
 Each mutating phase: run dry-run, read the log + DDL files, then `--execute`.
+
+> **Materialized views.** This deployment has 17 `TO`-target MVs whose source
+> and target tables are in the conversion set. They MUST be detached (phase 5.5)
+> before phase 6, or ClickHouse's `check_table_dependencies` blocks the `RENAME`
+> and the MVs would otherwise stay bound to the old tables and silently stop
+> aggregating. Phase 9 re-attaches them on chs1 (re-binding to the new tables)
+> and creates them on chs2. MVs are never converted to a Replicated engine —
+> only their target tables are.
 
 ---
 
@@ -238,6 +246,49 @@ DROP DATABASE IF EXISTS signoz_traces;   -- repeat per DB; refuses nothing, so b
 
 ---
 
+## Phase 5.5 — Capture + DETACH materialized views on chs1
+
+**Purpose:** snapshot every materialized-view DDL to a file, then `DETACH` the
+17 MVs on chs1. Detaching removes them from the dependency graph so phase 6 can
+`RENAME` their source/target tables. `DETACH` (not `DROP`) keeps the metadata on
+disk and is fully reversible; no data is lost because these are `TO`-target MVs
+whose data lives in the target tables (which phase 6 converts).
+
+**Must run before phase 6.** If you skip it, phase 6 refuses a bulk `--execute`
+(and would otherwise hit `Cannot rename ... because some tables depend on it`).
+
+**Dry run** (captures DDLs to files, prints the `DETACH` statements, detaches nothing):
+```bash
+python3 signoz_ch_replicate_migrate.py --phase 5.5 --ch1-host chs1 --ch2-host chs2
+```
+Review the captured DDLs under `signoz_ch_migration/mv/*.sql` and the index
+`signoz_ch_migration/mv_manifest.json`. **These files are the only record of the
+MVs once detached — keep them.**
+
+**Execute:**
+```bash
+python3 signoz_ch_replicate_migrate.py --phase 5.5 --ch1-host chs1 --ch2-host chs2 --execute \
+  2>&1 | tee "logs/phase5_5_$(date +%Y%m%d_%H%M%S).log"
+```
+
+**Verify (on chs1):** the MVs are gone from the active set:
+```sql
+SELECT count() FROM system.tables WHERE database LIKE 'signoz%' AND engine='MaterializedView';
+-- expect 0; detached MVs do not appear here
+SELECT database, name FROM system.detached_tables WHERE database LIKE 'signoz%';  -- CH 24.4+
+```
+
+**Revert (re-attach without converting anything):**
+```sql
+ATTACH TABLE signoz_metrics.samples_v4_agg_5m_mv;   -- repeat for each MV in mv_manifest.json
+```
+
+> Note: a plain `DETACH` re-attaches automatically if ClickHouse restarts. The
+> migration window involves no planned restart, but if a node does restart
+> between 5.5 and 6, re-run phase 5.5 before continuing.
+
+---
+
 ## Phase 6 — Convert local tables on chs1 (the critical phase)
 
 **Purpose, per table:** create a `Replicated*` shadow `<table>__repl_tmp`,
@@ -246,6 +297,8 @@ parity, then `RENAME` swap: original → `<table>__old_nonreplicated`, shadow �
 original. `.inner` MV tables and `__repl_tmp`/`__old_nonreplicated` artifacts
 are skipped automatically.
 
+> **Precondition:** materialized views must be detached first (phase 5.5). Phase
+> 6 checks for attached MVs and refuses a bulk `--execute` while any remain.
 > Merges are stopped on the source and shadow during the copy and restarted on
 > the new table after the swap.
 
@@ -384,28 +437,42 @@ DROP TABLE IF EXISTS signoz_traces.distributed_signoz_index_v2;
 
 ---
 
-## Phase 9 — Recreate Views / Materialized Views on chs2
+## Phase 9 — Re-attach MVs on chs1 + create them on chs2
 
-**Purpose:** replay `View` / `MaterializedView` DDL on chs2. MVs are INSERT
-triggers; both nodes need them so inserts landing on either replica populate the
-(replicated) target tables. Run **after** phase 7 so target/source tables exist.
+**Purpose:** undo phase 5.5 and complete the MV setup on both nodes. MVs are
+INSERT triggers; each node needs them so inserts landing on either replica
+populate the (replicated) target tables. Run **after** phase 7 so each MV's
+source and target tables already exist on chs2.
+
+Per MV, the script:
+- **chs1:** `ATTACH TABLE` the MV detached in 5.5. Re-attaching re-resolves the
+  source/target **by name**, so the MV binds to the new replicated tables. If
+  `ATTACH` can't recover, it logs the captured-DDL path for manual `CREATE`.
+- **chs2:** `CREATE` the MV from the captured DDL (UUID stripped, `IF NOT
+  EXISTS`, **never** `POPULATE` — historical data already arrived via the
+  replicated target tables).
 
 ```bash
 python3 signoz_ch_replicate_migrate.py --phase 9 --ch1-host chs1 --ch2-host chs2
 python3 signoz_ch_replicate_migrate.py --phase 9 --ch1-host chs1 --ch2-host chs2 --execute
 ```
-Generated DDL: `signoz_ch_migration/ddl/*.phase9.create_view_chs2.sql`.
+Reads `signoz_ch_migration/mv_manifest.json`; writes chs2 DDL to
+`signoz_ch_migration/ddl/*.phase9.create_mv_chs2.sql`.
 
-**Verify (on chs2):**
+**Verify (run on BOTH nodes — counts should match):**
 ```sql
-SELECT name, engine FROM system.tables
-WHERE database LIKE 'signoz%' AND engine IN ('View','MaterializedView')
-ORDER BY database, name;
+SELECT count() FROM system.tables
+WHERE database LIKE 'signoz%' AND engine = 'MaterializedView';     -- expect 17
 ```
+Then send a little fresh telemetry and confirm a rollup table grows on both
+nodes (e.g. `signoz_metrics.samples_v4_agg_5m`).
 
-**Revert (on chs2):**
+**Revert:**
 ```sql
-DROP VIEW IF EXISTS signoz_traces.<mv_name>;   -- or DROP TABLE for a MaterializedView
+-- chs1: just detach again (metadata stays on disk)
+DETACH TABLE signoz_metrics.samples_v4_agg_5m_mv;
+-- chs2: drop it (no data of its own)
+DROP TABLE IF EXISTS signoz_metrics.samples_v4_agg_5m_mv;   -- run on chs2
 ```
 
 ---
@@ -435,16 +502,20 @@ DROP VIEW IF EXISTS signoz_traces.<mv_name>;   -- or DROP TABLE for a Materializ
 
 If you need to abandon the migration entirely (collectors should be stopped):
 
-1. **chs2** — drop everything created there (views → distributed → replicated
+1. **chs2** — drop everything created there (MVs → distributed → replicated
    tables → databases):
    ```sql
-   DROP DATABASE IF EXISTS signoz_traces;   -- repeat for signoz_logs / signoz_metrics
+   DROP DATABASE IF EXISTS signoz_traces;   -- repeat for every signoz_* DB
    ```
 2. **chs1** — for every converted table, restore the old MergeTree using
    *State B* in phase 6's revert (rename `*__old_nonreplicated` back, drop the
    replicated copy, `SYSTEM DROP REPLICA ... FROM ZKPATH ...`, `SYSTEM START
    MERGES`).
-3. Leave `SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_REPLICATION=false` and restart
+3. **chs1** — re-attach the MVs so chs1 is exactly as it started:
+   ```sql
+   ATTACH TABLE signoz_metrics.samples_v4_agg_5m_mv;   -- repeat for each entry in mv_manifest.json
+   ```
+4. Leave `SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_REPLICATION=false` and restart
    collectors (phase 1 revert).
 
 ---
@@ -453,6 +524,8 @@ If you need to abandon the migration entirely (collectors should be stopped):
 
 | Symptom | Likely cause / action |
 | --- | --- |
+| `Cannot rename ... because some tables depend on it` (phase 6) | MVs not detached. Run phase 5.5 `--execute` first, then retry phase 6. |
+| `ATTACH failed for <db>.<mv>` (phase 9, chs1) | The MV's metadata couldn't re-bind. Recreate it manually from the captured `signoz_ch_migration/mv/<db>.<mv>.sql`. |
 | `cannot read system.zookeeper` (phase 2) | Keeper not configured/reachable. Fix `<zookeeper>`/`<keeper_server>`, restart CH. |
 | `expected replica=chs2, got chs1` (phase 3) | Wrong macros on chs2 → would collide in Keeper. Fix `<macros>`, restart, re-run. |
 | `Backup/Temp table already exists` (phase 6) | Leftover from a prior run. Inspect, then drop `*__repl_tmp` / handle `*__old_nonreplicated` before retrying. |
