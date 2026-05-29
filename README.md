@@ -217,6 +217,14 @@ python3 signoz_ch_replicate_migrate.py --phase 4 --ch1-host chs1 --ch2-host chs2
 `local_replicatable` list is your phase-6 worklist. Confirm `internal_inner_tables`
 is what you expect (these are handled via phase 9, not phase 6).
 
+**Coverage verdict:** the last line is the important one. `[COVERAGE OK]` means
+every table maps to a handled category (local→6/7, Distributed→8, View/MV→5.5/9)
+— nothing is silently skipped. `[COVERAGE WARNING]` lists any table whose engine
+**no phase recreates** (e.g. `Dictionary`, `Null`, `Buffer`); those would not
+land on chs2, so decide how to migrate them before proceeding. For this
+deployment (43 local + 43 Distributed + 17 MV, nothing else) you should see
+`[COVERAGE OK]`.
+
 **Revert:** delete the JSON file if you want; harmless.
 
 ---

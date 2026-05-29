@@ -578,13 +578,26 @@ def phase_4_inventory(ch1: "CH", args):
 
     print(f"[OK] inventory saved: {args.manifest}")
     print(f"total tables: {len(payload['tables'])}")
-    print(f"local replicatable: {len(payload['local_replicatable'])}")
-    print(f"already replicated: {len(payload['already_replicated'])}")
-    print(f"distributed: {len(payload['distributed'])}")
-    print(f"views/materialized views: {len(payload['views'])}")
+    print(f"local replicatable (phase 6/7): {len(payload['local_replicatable'])}")
+    print(f"already replicated (skip): {len(payload['already_replicated'])}")
+    print(f"distributed (phase 8): {len(payload['distributed'])}")
+    print(f"views/materialized views (phase 5.5/9): {len(payload['views'])}")
     print(f"internal .inner tables (handled via their MV): {len(payload['internal_inner_tables'])}")
     print(f"migration artifacts (*__repl_tmp / *__old): {len(payload['migration_artifacts'])}")
-    print(f"skipped: {len(payload['skipped'])}")
+    print(f"skipped (no phase handles these): {len(payload['skipped'])}")
+
+    # Coverage verdict: every table must land in a handled category. The skipped
+    # bucket is exactly the tables whose engine no phase recreates -- if it is
+    # non-empty, the migration would silently leave those tables off chs2.
+    if payload["skipped"]:
+        print(
+            "\n[COVERAGE WARNING] these tables use engines NO phase handles -- "
+            "they will NOT be created on chs2. Decide how to migrate them before proceeding:"
+        )
+        for t in payload["skipped"]:
+            print(f"    {t['database']}.{t['name']}  ({t['engine']})")
+    else:
+        print("\n[COVERAGE OK] every table falls into a handled category; nothing is silently skipped.")
 
 
 def phase_5_create_databases(ch1: "CH", ch2: "CH", args):
