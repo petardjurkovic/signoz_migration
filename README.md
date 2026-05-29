@@ -1,14 +1,23 @@
-# SigNoz ClickHouse: MergeTree → ReplicatedMergeTree migration
+# SigNoz ClickHouse: single-node → 2-node replicated cluster migration
 
 Operational runbook for `signoz_ch_replicate_migrate.py`.
 
-Goal: take a single-node SigNoz ClickHouse install and convert its local
-`MergeTree`-family tables to `Replicated*MergeTree`, then bring up a second
-replica (`chs2`) so the cluster is **1 shard / 2 replicas** and SigNoz can run
-with `SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_REPLICATION=true`.
+Goal: take a single-node SigNoz ClickHouse install and make **every** table exist
+and stay consistent on a second node (`chs2`), so the cluster is **1 shard / 2
+replicas** and SigNoz can run with `SIGNOZ_OTEL_COLLECTOR_CLICKHOUSE_REPLICATION=true`.
 
-Conversion method is the **shadow-table** path (create replicated shadow →
-`ATTACH PARTITION FROM` original → verify → `RENAME` swap). We never use
+"Replicate everything" means three different mechanisms, because only data tables
+can actually *be* a `Replicated*` engine — the rest are made consistent by
+recreating their DDL on both nodes:
+
+| Table kind | What happens |
+| --- | --- |
+| `MergeTree` **family** (MergeTree, Replacing/Summing/Aggregating/Collapsing/VersionedCollapsing) | Converted to the matching `Replicated*` engine — true Keeper-backed replication |
+| `Distributed` | Recreated on chs2 (routing only, no data) |
+| `MaterializedView` | Detached during conversion, then re-attached on chs1 + created on chs2 |
+
+Conversion of the data tables uses the **shadow-table** path (create replicated
+shadow → `ATTACH PARTITION FROM` original → verify → `RENAME` swap). We never use
 `ALTER TABLE ... MODIFY ENGINE`.
 
 ---
